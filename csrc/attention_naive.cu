@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
 #include <cmath>
@@ -122,7 +122,7 @@ torch::Tensor attention_naive_cuda(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value) {
-  at::cuda::CUDAGuard device_guard(query.device());
+  c10::cuda::CUDAGuard device_guard(query.device());
 
   const auto batch_heads = query.size(0) * query.size(1);
   const auto sequence = query.size(2);
