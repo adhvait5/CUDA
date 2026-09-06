@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Required by cuBLAS on CUDA 10.2+ when deterministic algorithms are enabled.
+# Set before importing torch.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
 

@@ -1,9 +1,9 @@
 # CUDA Attention Kernel Optimization
 
 An educational CUDA performance-engineering project for scaled dot-product
-self-attention on an NVIDIA GTX 1050 Ti. This milestone implements the FP32
-PyTorch reference, deterministic correctness tests, and a reproducible CUDA
-timing scaffold. No CUDA attention kernel has been implemented yet.
+self-attention on an NVIDIA GTX 1050 Ti. Milestone 2 adds an intentionally
+straightforward FP32 CUDA baseline beside the PyTorch reference. It is designed
+for clarity and correctness, not performance.
 
 ## Reference operation
 
@@ -42,13 +42,21 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 
 ## Validate correctness
 
-Run the full deterministic FP32 test suite:
+Build the CUDA extension first. This requires the CUDA Toolkit (including
+`nvcc`) and Microsoft C++ Build Tools; the toolkit must be compatible with the
+CUDA-enabled PyTorch wheel:
+
+```powershell
+python setup.py build_ext --inplace
+```
+
+Then run the full suite:
 
 ```powershell
 python -m pytest tests -v
 ```
 
-For a lightweight CUDA-only smoke check:
+For a lightweight PyTorch-reference CUDA smoke check:
 
 ```powershell
 python python/validate.py --quick
@@ -57,7 +65,7 @@ python python/validate.py --quick
 The full validation sweep covers sequence lengths 32, 64, 128, 256, and 512
 and head dimensions 32, 64, and 128.
 
-## Benchmark the reference
+## Benchmark the reference and baseline
 
 Run the requested measurement grid:
 
@@ -67,8 +75,9 @@ python python/benchmark.py
 
 The script allocates inputs outside timed regions, warms up each case, uses
 CUDA events, waits for recorded events, and synchronizes before returning
-results. It overwrites `benchmarks/results.csv` with measurements from the
-current GPU only. The tracked CSV contains a header and no fabricated results.
+results. It overwrites `benchmarks/results.csv` with newly measured PyTorch
+reference and naive CUDA rows from the current GPU only. The repository never
+adds fabricated performance results.
 
 Use a short smoke benchmark while setting up:
 
@@ -76,21 +85,49 @@ Use a short smoke benchmark while setting up:
 python python/benchmark.py --sequences 32,128 --head-dims 32,64 --warmup 5 --iterations 20
 ```
 
+To measure only the reference without building the extension:
+
+```powershell
+python python/benchmark.py --implementations reference
+```
+
+## Naive CUDA baseline
+
+`csrc/attention_naive.cu` intentionally separates attention into three CUDA
+kernels:
+
+1. `compute_scores_naive_kernel`: one thread computes one `QK^T` score and
+   serially loops over `head_dim`.
+2. `softmax_rows_naive_kernel`: one block maps to one attention row, but only
+   thread zero computes max, exponentials, sum, and normalization serially.
+3. `compute_output_naive_kernel`: one thread computes one output element and
+   serially loops over the key sequence.
+
+The flattened tensor convention is `BH = batch * heads`. Scores are indexed as
+`[BH, query_row, key_col]`; outputs are indexed as
+`[BH, query_row, output_dim]`. The mapping is easy to inspect but has expected
+bottlenecks: redundant global reads of Q/K/V, strided K reads across neighboring
+score threads, a single-thread softmax row, and three kernel launches with a
+materialized `N x N` score buffer. Shared-memory tiling and parallel reductions
+are deliberately deferred to later milestones.
+
 ## Before the CUDA milestone
 
 Verify that CUDA is available to PyTorch, every test passes on the GTX 1050
-Ti, reference outputs are finite, and `benchmarks/results.csv` contains
-locally measured rows. Record the PyTorch version, CUDA runtime version,
-driver version, and GPU name alongside any results you share. Later CUDA
-versions will be measured against these conditions rather than against
-pre-filled performance claims.
+Ti, the extension was compiled with `TORCH_CUDA_ARCH_LIST=6.1`, CUDA outputs
+match the PyTorch reference, and `benchmarks/results.csv` contains locally
+measured rows. Record the PyTorch version, CUDA runtime version, driver
+version, and GPU name alongside any results you share. Later CUDA versions will
+be measured against these conditions rather than against pre-filled performance
+claims.
 
 ## Layout
 
 ```text
-csrc/                 # Reserved for later C++/CUDA extension sources
+csrc/                 # PyBind binding and naive C++/CUDA extension sources
 python/
   attention_reference.py
+  attention_cuda.py
   benchmark.py
   validate.py
 tests/
