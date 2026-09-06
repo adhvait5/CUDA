@@ -2,8 +2,9 @@
 
 An educational CUDA performance-engineering project for scaled dot-product
 self-attention on an NVIDIA GTX 1050 Ti. Milestone 2 adds an intentionally
-straightforward FP32 CUDA baseline beside the PyTorch reference. It is designed
-for clarity and correctness, not performance.
+straightforward FP32 CUDA baseline. Milestone 3 evolves it into a separate
+shared-memory-tiled, parallel-softmax CUDA path while preserving the baseline
+for direct comparison.
 
 ## Reference operation
 
@@ -75,9 +76,10 @@ python python/benchmark.py
 
 The script allocates inputs outside timed regions, warms up each case, uses
 CUDA events, waits for recorded events, and synchronizes before returning
-results. It overwrites `benchmarks/results.csv` with newly measured PyTorch
-reference and naive CUDA rows from the current GPU only. The repository never
-adds fabricated performance results.
+results. It overwrites `benchmarks/results.csv` with newly measured PyTorch,
+naive CUDA, and optimized CUDA rows from the current GPU only. For optimized
+rows it records both 128- and 256-thread softmax configurations. The repository
+never adds fabricated performance results.
 
 Use a short smoke benchmark while setting up:
 
@@ -91,7 +93,7 @@ To measure only the reference without building the extension:
 python python/benchmark.py --implementations reference
 ```
 
-## Naive CUDA baseline
+## CUDA implementations
 
 `csrc/attention_naive.cu` intentionally separates attention into three CUDA
 kernels:
@@ -109,7 +111,29 @@ The flattened tensor convention is `BH = batch * heads`. Scores are indexed as
 bottlenecks: redundant global reads of Q/K/V, strided K reads across neighboring
 score threads, a single-thread softmax row, and three kernel launches with a
 materialized `N x N` score buffer. Shared-memory tiling and parallel reductions
-are deliberately deferred to later milestones.
+are deliberately absent from this baseline.
+
+`csrc/attention_optimized.cu` is an evolution of that design, not
+FlashAttention:
+
+1. Score and output matrix products use 16x16 shared-memory tiles. Cooperative
+   row-major loads make adjacent threads access adjacent Q/K/V elements, and
+   reuse each tile value across 16 multiply-adds.
+2. Softmax remains a separate kernel with one block per `[batch*head, row]`.
+   It calculates stable `max`, `exp(score - max)`, and sum reductions in
+   parallel. Warp shuffles reduce within warps; only one value per warp enters
+   a small shared-memory cross-warp reduction.
+3. The optimized binding accepts `softmax_threads=128` or `256`. Both are
+   benchmarked rather than claiming a preset winner: 256 gives more parallelism
+   for long rows, while 128 may use fewer resources or waste fewer lanes.
+
+The optimized path still materializes an `N x N` probability matrix and still
+launches separate score, softmax, and output kernels. It is intentionally
+educational and is not an online/fused attention algorithm.
+
+CUDA results use `torch.testing.assert_close(rtol=1e-4, atol=1e-4)`. This
+explicit tolerance accounts for legitimate FP32 differences caused by tiled
+dot-product and parallel-reduction accumulation order.
 
 ## Before the CUDA milestone
 

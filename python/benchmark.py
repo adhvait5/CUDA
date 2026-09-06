@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from python.attention_reference import scaled_dot_product_attention
-from python.attention_cuda import cuda_attention, naive_attention
+from python.attention_cuda import cuda_attention, naive_attention, optimized_attention
 
 
 DEFAULT_SEQUENCES = (32, 64, 128, 256, 512)
@@ -31,6 +31,7 @@ CSV_FIELDS = (
     "head_dim",
     "dtype",
     "device",
+    "softmax_threads",
     "warmup_iterations",
     "timed_iterations",
     "median_latency_ms",
@@ -85,9 +86,17 @@ def main() -> None:
     parser.add_argument(
         "--implementations",
         nargs="+",
-        choices=("reference", "naive"),
-        default=("reference", "naive"),
-        help="Implementations to measure. The default compares the reference and CUDA baseline.",
+        choices=("reference", "naive", "optimized"),
+        default=("reference", "naive", "optimized"),
+        help="Implementations to measure. The default compares all implemented versions.",
+    )
+    parser.add_argument(
+        "--softmax-threads",
+        nargs="+",
+        type=int,
+        choices=(128, 256),
+        default=(128, 256),
+        help="Parallel-softmax block sizes to measure for the optimized kernel.",
     )
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "benchmarks" / "results.csv")
     args = parser.parse_args()
@@ -96,10 +105,19 @@ def main() -> None:
         raise SystemExit("CUDA is unavailable. This benchmark requires a CUDA-enabled PyTorch build.")
     if min(args.batch_size, args.heads, args.warmup) <= 0 or args.iterations < 4:
         raise SystemExit("Batch size, heads, and warmup must be positive; iterations must be at least 4.")
-    if "naive" in args.implementations and cuda_attention is None:
+    if "naive" in args.implementations and (
+        cuda_attention is None or not hasattr(cuda_attention, "naive_forward")
+    ):
         raise SystemExit(
             "The cuda_attention extension is not built. Build it with "
             "`python setup.py build_ext --inplace`, or benchmark only `--implementations reference`."
+        )
+    if "optimized" in args.implementations and (
+        cuda_attention is None or not hasattr(cuda_attention, "optimized_forward")
+    ):
+        raise SystemExit(
+            "The optimized extension entry point is unavailable. Rebuild with "
+            "`python setup.py build_ext --inplace`, or omit `optimized`."
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -109,33 +127,39 @@ def main() -> None:
         for head_dim in args.head_dims:
             query, key, value = make_inputs(args.batch_size, args.heads, sequence, head_dim)
             implementations = {
-                "reference": ("pytorch_reference", scaled_dot_product_attention),
-                "naive": ("naive_cuda", naive_attention),
+                "reference": ("pytorch_reference", scaled_dot_product_attention, (None,)),
+                "naive": ("naive_cuda", naive_attention, (None,)),
+                "optimized": ("optimized_cuda", optimized_attention, args.softmax_threads),
             }
             for implementation in args.implementations:
-                label, attention = implementations[implementation]
-                samples = measure_cuda_ms(
-                    lambda: attention(query, key, value), args.warmup, args.iterations
-                )
-                row = {
-                    "implementation": label,
-                    "batch_size": args.batch_size,
-                    "heads": args.heads,
-                    "sequence_length": sequence,
-                    "head_dim": head_dim,
-                    "dtype": "float32",
-                    "device": device_name,
-                    "warmup_iterations": args.warmup,
-                    "timed_iterations": args.iterations,
-                    "median_latency_ms": f"{statistics.median(samples):.6f}",
-                    "p25_latency_ms": f"{statistics.quantiles(samples, n=4, method='inclusive')[0]:.6f}",
-                    "p75_latency_ms": f"{statistics.quantiles(samples, n=4, method='inclusive')[2]:.6f}",
-                }
-                rows.append(row)
-                print(
-                    f"{label:17} N={sequence:3d}, D={head_dim:3d}: "
-                    f"{row['median_latency_ms']} ms median"
-                )
+                label, attention, thread_options = implementations[implementation]
+                for softmax_threads in thread_options:
+                    if softmax_threads is None:
+                        timed_call = lambda: attention(query, key, value)
+                    else:
+                        timed_call = lambda: attention(query, key, value, softmax_threads)
+                    samples = measure_cuda_ms(timed_call, args.warmup, args.iterations)
+                    row = {
+                        "implementation": label,
+                        "batch_size": args.batch_size,
+                        "heads": args.heads,
+                        "sequence_length": sequence,
+                        "head_dim": head_dim,
+                        "dtype": "float32",
+                        "device": device_name,
+                        "softmax_threads": softmax_threads or "",
+                        "warmup_iterations": args.warmup,
+                        "timed_iterations": args.iterations,
+                        "median_latency_ms": f"{statistics.median(samples):.6f}",
+                        "p25_latency_ms": f"{statistics.quantiles(samples, n=4, method='inclusive')[0]:.6f}",
+                        "p75_latency_ms": f"{statistics.quantiles(samples, n=4, method='inclusive')[2]:.6f}",
+                    }
+                    rows.append(row)
+                    config = "" if softmax_threads is None else f", softmax_threads={softmax_threads}"
+                    print(
+                        f"{label:17} N={sequence:3d}, D={head_dim:3d}{config}: "
+                        f"{row['median_latency_ms']} ms median"
+                    )
 
     with args.output.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)

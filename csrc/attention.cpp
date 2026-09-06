@@ -39,9 +39,29 @@ torch::Tensor attention_naive(
   return attention_naive_cuda(query, key, value);
 }
 
+torch::Tensor attention_optimized(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    int64_t softmax_threads) {
+  check_attention_input(query, key, value);
+  TORCH_CHECK(
+      softmax_threads == 128 || softmax_threads == 256,
+      "softmax_threads must be 128 or 256 for the optimized CUDA kernel");
+  return attention_optimized_cuda(query, key, value, softmax_threads);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("naive_forward", &attention_naive,
         "Naive FP32 scaled dot-product self-attention (CUDA)");
+  m.def(
+      "optimized_forward",
+      &attention_optimized,
+      pybind11::arg("query"),
+      pybind11::arg("key"),
+      pybind11::arg("value"),
+      pybind11::arg("softmax_threads") = 128,
+      "Shared-memory-tiled FP32 scaled dot-product self-attention (CUDA)");
 }

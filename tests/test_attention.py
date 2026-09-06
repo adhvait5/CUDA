@@ -10,7 +10,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 
 from python.attention_reference import scaled_dot_product_attention
-from python.attention_cuda import cuda_attention, naive_attention
+from python.attention_cuda import cuda_attention, naive_attention, optimized_attention
 
 
 TARGET_SHAPES = [
@@ -18,7 +18,9 @@ TARGET_SHAPES = [
     for sequence in (32, 64, 128, 256, 512)
     for head_dim in (32, 64, 128)
 ]
-CUDA_EXTENSION_AVAILABLE = cuda_attention is not None
+TILED_BOUNDARY_SHAPES = [(33, 47), (65, 31)]
+NAIVE_CUDA_AVAILABLE = cuda_attention is not None and hasattr(cuda_attention, "naive_forward")
+OPTIMIZED_CUDA_AVAILABLE = cuda_attention is not None and hasattr(cuda_attention, "optimized_forward")
 
 
 def independent_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -34,7 +36,7 @@ def independent_attention(query: torch.Tensor, key: torch.Tensor, value: torch.T
     return outputs
 
 
-@pytest.mark.parametrize(("sequence", "head_dim"), TARGET_SHAPES)
+@pytest.mark.parametrize(("sequence", "head_dim"), TARGET_SHAPES + TILED_BOUNDARY_SHAPES)
 def test_cuda_reference_matches_independent_formula(sequence: int, head_dim: int) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA-enabled PyTorch is required for GTX 1050 Ti reference tests")
@@ -79,7 +81,7 @@ def test_reference_rejects_mismatched_shapes() -> None:
         scaled_dot_product_attention(query, key, query)
 
 
-@pytest.mark.skipif(not CUDA_EXTENSION_AVAILABLE, reason="Build cuda_attention before testing the CUDA baseline")
+@pytest.mark.skipif(not NAIVE_CUDA_AVAILABLE, reason="Build cuda_attention before testing the CUDA baseline")
 @pytest.mark.parametrize(("sequence", "head_dim"), TARGET_SHAPES)
 def test_naive_cuda_matches_pytorch_reference(sequence: int, head_dim: int) -> None:
     """The future optimization oracle: each naive CUDA output must match V0."""
@@ -100,8 +102,47 @@ def test_naive_cuda_matches_pytorch_reference(sequence: int, head_dim: int) -> N
     assert torch.isfinite(actual).all()
 
 
-@pytest.mark.skipif(not CUDA_EXTENSION_AVAILABLE, reason="Build cuda_attention before testing the CUDA baseline")
+@pytest.mark.skipif(not NAIVE_CUDA_AVAILABLE, reason="Build cuda_attention before testing the CUDA baseline")
 def test_naive_cuda_rejects_noncontiguous_input() -> None:
     tensor = torch.randn((1, 1, 8, 16), device="cuda", dtype=torch.float32).transpose(-1, -2)
     with pytest.raises(RuntimeError, match="contiguous"):
         naive_attention(tensor, tensor, tensor)
+
+
+@pytest.mark.skipif(
+    not OPTIMIZED_CUDA_AVAILABLE,
+    reason="Rebuild cuda_attention before testing the optimized CUDA kernel",
+)
+@pytest.mark.parametrize(("sequence", "head_dim"), TARGET_SHAPES + TILED_BOUNDARY_SHAPES)
+@pytest.mark.parametrize("softmax_threads", (128, 256))
+def test_optimized_cuda_matches_pytorch_reference(
+    sequence: int, head_dim: int, softmax_threads: int
+) -> None:
+    """Tiled score/output and parallel softmax must stay within FP32 tolerance."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA-enabled PyTorch is required for CUDA extension tests")
+
+    generator = torch.Generator(device="cuda").manual_seed(
+        9000 + sequence * 100 + head_dim + softmax_threads
+    )
+    shape = (1, 1, sequence, head_dim)
+    query, key, value = (
+        torch.randn(shape, device="cuda", dtype=torch.float32, generator=generator) for _ in range(3)
+    )
+    expected = scaled_dot_product_attention(query, key, value)
+    actual = optimized_attention(query, key, value, softmax_threads)
+
+    # Tiled dot products and parallel reductions change FP32 accumulation order.
+    # This tolerance is intentionally explicit and shared across all test shapes.
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(
+    not OPTIMIZED_CUDA_AVAILABLE,
+    reason="Rebuild cuda_attention before testing the optimized CUDA kernel",
+)
+def test_optimized_cuda_rejects_unsupported_softmax_block_size() -> None:
+    tensor = torch.randn((1, 1, 8, 16), device="cuda", dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="softmax_threads"):
+        optimized_attention(tensor, tensor, tensor, softmax_threads=64)

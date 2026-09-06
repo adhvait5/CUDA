@@ -18,7 +18,11 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="cuda_attention",
-            sources=["csrc/attention.cpp", "csrc/attention_naive.cu"],
+            sources=[
+                "csrc/attention.cpp",
+                "csrc/attention_naive.cu",
+                "csrc/attention_optimized.cu",
+            ],
             extra_compile_args={
                 "cxx": ["/O2", "/std:c++17"],
                 # Deliberately omit --use_fast_math to retain conservative FP32
