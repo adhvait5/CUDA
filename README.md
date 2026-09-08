@@ -93,6 +93,75 @@ To measure only the reference without building the extension:
 python python/benchmark.py --implementations reference
 ```
 
+## Performance
+
+### Measured environment
+
+- GPU: NVIDIA GeForce GTX 1050 Ti
+- CUDA Toolkit / PyTorch CUDA runtime: 12.6
+- PyTorch: 2.8.0+cu126
+- Precision: float32
+- Input layout: `[batch=1, heads=1, sequence, head_dim]`
+- Method: 25 warmup iterations, 100 CUDA-event timing iterations, median latency
+
+The values below are the actual medians supplied from this GPU. “Optimized”
+uses the faster of the measured 128- and 256-thread softmax configurations for
+each shape. Speedup is calculated as `naive_latency / optimized_latency`.
+
+| Sequence length | Head dimension | Naive CUDA (ms) | Optimized CUDA (ms) | Softmax threads | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 32 | 0.061248 | 0.062464 | 128 | 0.981× |
+| 32 | 64 | 0.063488 | 0.062464 | 128 | 1.016× |
+| 32 | 128 | 0.060992 | 0.063424 | 128 or 256 (tie) | 0.962× |
+| 64 | 32 | 0.089760 | 0.063280 | 256 | 1.418× |
+| 64 | 64 | 0.100352 | 0.062096 | 256 | 1.616× |
+| 64 | 128 | 0.126576 | 0.061952 | 256 | 2.043× |
+| 128 | 32 | 0.169776 | 0.061632 | 256 | 2.755× |
+| 128 | 64 | 0.218880 | 0.072576 | 128 | 3.016× |
+| 128 | 128 | 0.326448 | 0.102400 | 128 | 3.188× |
+| 256 | 32 | 0.492544 | 0.107520 | 128 | 4.581× |
+| 256 | 64 | 0.683008 | 0.168960 | 128 | 4.042× |
+| 256 | 128 | 1.067808 | 0.281600 | 128 | 3.792× |
+| 512 | 32 | 1.667072 | 0.324592 | 128 | 5.136× |
+| 512 | 64 | 2.445312 | 0.546816 | 128 | 4.472× |
+| 512 | 128 | 4.150560 | 1.005344 | 128 | 4.128× |
+
+### Optimization analysis
+
+The naive score kernel assigns one thread to each attention score but makes
+that thread reload a query vector and a key vector from global memory while it
+loops over the head dimension. The output kernel similarly reloads
+probabilities and value vectors. Its softmax assigns an entire row to one
+active thread, leaving the rest of its block idle. These choices make the
+baseline easy to understand, but create redundant global-memory traffic and
+very little softmax parallelism.
+
+The optimized score and output kernels cooperatively load 16×16 Q/K and
+probability/V tiles into shared memory. Adjacent loading threads access
+adjacent row-major elements, which makes global-memory transactions more
+coalesced. Threads then reuse the shared values for multiple multiply-adds,
+reducing redundant global loads.
+
+The optimized softmax keeps the stable formulation—row maximum, then
+`exp(score - max)`, then row-sum normalization—but divides a row across 128 or
+256 threads. Warp shuffle operations reduce values within each warp, while a
+small shared-memory array combines the warp partials. This replaces the
+baseline’s one-thread row reduction with a parallel reduction.
+
+At sequence length 32, these changes are neutral or slightly slower
+(0.962×–1.016×) because their setup and launch costs are large relative to the
+small amount of attention work. Benefits increase with sequence length; the
+largest measured speedup is 5.136× at sequence length 512 and head dimension
+32. For the N=128, N=256, and N=512 measurements, 128 softmax threads was
+faster in all but N=128/D=32; thread-count choices should remain measurement
+driven.
+
+### Profiling
+
+No Nsight Compute or Nsight Systems metric output has been provided yet.
+Therefore this README does not report occupancy, achieved bandwidth, DRAM
+throughput, FLOP/s, warp stalls, or any other profiler-derived value.
+
 ## CUDA implementations
 
 `csrc/attention_naive.cu` intentionally separates attention into three CUDA
@@ -157,7 +226,7 @@ python/
 tests/
   test_attention.py
 benchmarks/
-  results.csv          # Header only until you run the benchmark
+  results.csv          # Locally generated benchmark data
   plots/               # Reserved for measured-data plots
 docs/
   optimization_notes.md
